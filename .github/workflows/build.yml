@@ -1,93 +1,251 @@
-name: strongR-frida
+name: strongR-frida-build
 
 on:
+  schedule:
+    - cron: "0 9/12 * * *"
   workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+jobs: 
+  check_version:
+    runs-on: ubuntu-24.04
+
+    outputs:
+      FRIDA_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
+      ALREADY_RELEASE: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE }}
     steps:
-      - name: Check latest Frida version
-        id: check_version
-        uses: actions/github-script@v6
+      - name: Pull Frida Latest Release
+        id: pullFridaLatestRelease
+        uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const releaseResponse = await github.rest.repos.getLatestRelease({
+              owner: 'frida',
+              repo: 'frida',
+            })
+            const {
+              data: { tag_name: ver }
+            } = releaseResponse;
+            core.setOutput('FRIDA_VERSION', ver);
+      - name: Check release version
+        id: checkReleaseVersion
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
             try {
-              const { data: { tag_name: ver } } = await github.rest.repos.getLatestRelease({
-                owner: 'frida',
-                repo: 'frida'
+              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
+              const releaseResponse = await github.rest.repos.getReleaseByTag({
+                owner: '${{ secrets.GIT_OWNER }}',
+                repo: '${{ secrets.GIT_REPO }}',
+                tag: releaseVersion
               });
-              console.log(`Latest frida version: ${ver}`);
-              core.setOutput('FRIDA_VERSION', ver);
+              const {
+                data: { tag_name: ver }
+              } = releaseResponse;
+              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
+                  core.setOutput('ALREADY_RELEASE', '1');
+              }
+              else{
+                  core.setOutput('ALREADY_RELEASE', '0');
+              }
             } catch (e) {
-              core.setFailed(e.message);
+              if(e.message == 'Not Found'){
+                core.setOutput('ALREADY_RELEASE', '0');
+              }
+              else{
+                core.setFailed(e.message);
+              }
             }
 
-      - name: Create Release
-        uses: actions/create-release@v1
-        id: create_release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.check_version.outputs.FRIDA_VERSION }}
-          release_name: ${{ steps.check_version.outputs.FRIDA_VERSION }}
-          draft: false
-          prerelease: false
+  android_build:
+    runs-on: ubuntu-24.04
+    needs: [check_version]
+    if: needs.check_version.outputs.ALREADY_RELEASE == '0'
 
-      - name: Setup build environment
-        uses: actions/setup-java@v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          node-version: 20
 
-      - name: Install dependencies
+      - uses: de-vri-es/setup-git-credentials@v2
+        with:
+          credentials: ${{secrets.GIT_CREDENTIALS}}
+
+      - name: set up JDK 17
+        uses: actions/setup-java@v1
+        with:
+          java-version: 17
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1.0.6
+        with:
+          ndk-version: r25b
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install build-essential tree ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison xz-utils python3-requests python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386 -y
+          python3 -m pip install lief
+          python3 -m pip install graphlib
+      
+      - name: install ruby
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev python3-pip
-          pip3 install lief graphlib
+          sudo apt-get install -y curl gpg
+          curl -sSL https://rvm.io/mpapis.asc | gpg --import -
+          curl -sSL https://rvm.io/pkuczynski.asc | gpg --import -
+          curl -sSL https://get.rvm.io | bash -s stable
+          source ~/.rvm/scripts/rvm
+          rvm install ruby --with-openssl-dir=/usr/include/openssl || (cat /home/runner/.rvm/log/$(date +%s)_ruby-3.0.0/make.log && exit 1)
+          rvm use ruby --default
 
-      - name: Build frida for Android
+      - name: build frida for Android
+        shell: bash
         run: |
-          git config --global user.name "${{ github.actor }}"
-          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
-
-          echo "Cloning frida version: ${{ steps.check_version.outputs.FRIDA_VERSION }}"
-          git clone https://github.com/frida/frida.git --branch ${{ steps.check_version.outputs.FRIDA_VERSION }} --single-branch
-
-          export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk-bundle
-
-          git clone https://github.com/hluwa/Patchs.git
-
-          cd frida
-          for path in ../Patchs/strongR-frida/*; do
-            if [ -d "$path" ]; then
-              name=$(basename "$path")
-              if [ -d "subprojects/$name" ]; then
-                echo "Apply patches in $path to frida/subprojects/$name"
-                cd subprojects/$name
-                git am ../../../Patchs/strongR-frida/$name/*.patch
-                cd ../..
-              fi
-            fi
-          done
+          git config --global user.name "${{ secrets.GIT_NAME }}"
+          git config --global user.email "${{ secrets.GIT_EMAIL }}"
+          git clone ${{ secrets.PATCH_REPO }} Patchs
+          export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+          git clone -b ${{ needs.check_version.outputs.FRIDA_VERSION }} --recurse-submodules https://github.com/frida/frida
+          cd frida/subprojects/frida-core
+          git am ../../../Patchs/strongR-frida/frida-core/*.patch
+      - name: two step patch   
+        shell: bash
+        run: |
+          cd frida/subprojects/frida-gum/gum
+          git am ../../../../Patchs/strongR-frida/frida-gum/*.patch
+          cd ../../../
+          
+          mkdir build-arm
+          cd build-arm
+          ../configure --host=android-arm
+          make
           cd ..
+          
+          mkdir build-arm64
+          cd build-arm64
+          ../configure --host=android-arm64
+          make
+          cd ..
+          
+          mkdir build-x86
+          cd build-x86
+          ../configure --host=android-x86
+          make
+          cd ..
+                    
+          mkdir build-x86_64
+          cd build-x86_64
+          ../configure --host=android-x86_64
+          make
 
-          ARCHES="android-arm android-arm64 android-x86 android-x86_64"
-          for ARCH in $ARCHES; do
-            mkdir build-$ARCH
-            cd build-$ARCH
-            ../frida/configure --host=$ARCH
-            make
-            cd ..
-          done
+          ls build-x86_64
+          
+      - name: package build result for Android
+        shell: bash
+        run: |
+          pushd frida
 
-      - name: Upload Artifacts
+          mkdir release-assets
+
+          xz -c build-arm/frida-android-arm/bin/frida-server > release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
+          xz -c build-arm64/frida-android-arm64/bin/frida-server > release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+          xz -c build-x86/frida-android-x86/bin/frida-server > release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+          xz -c build-x86_64/frida-android-x86_64/bin/frida-server > release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+          xz -c build-arm/frida-android-arm/bin/frida-inject > release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
+          xz -c build-arm64/frida-android-arm64/bin/frida-inject > release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+          xz -c build-x86/frida-android-x86/bin/frida-inject > release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+          xz -c build-x86_64/frida-android-x86_64/bin/frida-inject > release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+          xz -c build-arm/frida-android-arm/lib/frida/32/frida-gadget.so > release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.xz
+          xz -c build-arm64/frida-android-arm64/lib/frida/64/frida-gadget.so > release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.xz
+          xz -c build-x86/frida-android-x86/lib/frida/32/frida-gadget.so > release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.xz
+          xz -c build-x86_64/frida-android-x86_64/lib/frida/64/frida-gadget.so > release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.xz
+
+          popd
+      - name: Upload artifact hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
         uses: actions/upload-artifact@v4
         with:
-          name: frida-server-builds
-          path: |
-            build-android-arm/frida-server
-            build-android-arm64/frida-server
-            build-android-x86/frida-server
-            build-android-x86_64/frida-server
+          name: hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm
+          path: frida/release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
+      - name: Upload artifact hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64
+          path: frida/release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+      - name: Upload artifact hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86
+          path: frida/release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+      - name: Upload artifact hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64
+          path: frida/release-assets/hluda-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+      - name: Upload artifact hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm
+          path: frida/release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.xz
+      - name: Upload artifact hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64
+          path: frida/release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.xz
+      - name: Upload artifact hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86
+          path: frida/release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.xz
+      - name: Upload artifact hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64
+          path: frida/release-assets/hluda-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.xz
+      - name: Upload artifact hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so
+          path: frida/release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.xz
+      - name: Upload artifact hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so
+          path: frida/release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.xz
+      - name: Upload artifact hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so
+          path: frida/release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.xz
+      - name: Upload artifact hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so
+          path: frida/release-assets/hluda-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.xz
+
+
+  create_release:
+    runs-on: ubuntu-20.04
+    needs: [check_version, android_build]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Ddisplay release assets
+        run: tree ${{ github.workspace }}/release-assets
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check_version.outputs.FRIDA_VERSION }}
+          fail_on_unmatched_files: true
+          files: release-assets/*
